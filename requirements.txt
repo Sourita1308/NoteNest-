@@ -1,0 +1,28 @@
+# RAG Study Chatbot – Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# — Core LangChain —
+langchain
+langchain-community
+langchain-openai
+
+# — Vector store —
+chromadb
+
+# — Embeddings (free, local, no API key) —
+sentence-transformers
+huggingface-hub
+
+# — PDF loading —
+pypdf
+
+# — LLM APIs (choose one or both) —
+openai
+google-generativeai
+
+# — UI —
+streamlit
+
+# — Utilities —
+python-dotenv
+tiktoken
