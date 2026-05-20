@@ -1,217 +1,263 @@
 """
-RAG Study Chatbot — Day 1
-Ingestion Pipeline: PDF → Chunks → Embeddings → ChromaDB
+NoteNest — Day 3
+ingest.py — Updated Ingestion Pipeline
 
-Run this once per new set of PDFs:
-    python ingest.py
-Or with a custom data folder:
-    python ingest.py --data_dir ./my_notes --persist_dir ./vectorstore
+New in Day 3:
+  - Pinecone cloud vector DB (replaces ChromaDB local)
+  - Accepts uploaded files directly (for Streamlit UI upload)
+  - Clear + re-ingest functionality
+  - Falls back to ChromaDB if no Pinecone key set
+
+Usage:
+    python ingest.py                        # ingest from ./data folder
+    python ingest.py --clear                # wipe Pinecone index + re-ingest
 """
 
 import os
 import argparse
 import time
+import tempfile
 from pathlib import Path
+from dotenv import load_dotenv
 
-from langchain_community.document_loaders import PyPDFDirectoryLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, PyPDFDirectoryLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
 
+load_dotenv()
 
 # ─────────────────────────────────────────────
-# Configuration — tweak these as needed
+# Configuration
 # ─────────────────────────────────────────────
-CHUNK_SIZE      = 512    # tokens per chunk (512 is ideal for RAG)
-CHUNK_OVERLAP   = 64     # overlap keeps context across chunk boundaries
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # free, fast, offline
-TOP_K_DEFAULT   = 4      # how many chunks to retrieve at query time
+CHUNK_SIZE      = 512
+CHUNK_OVERLAP   = 64
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+PINECONE_INDEX  = "notenest"   # your Pinecone index name
 
 
-def load_pdfs(data_dir: str) -> list:
-    """
-    Load all PDFs from a directory.
-    Returns a list of LangChain Document objects (one per page).
-    """
-    data_path = Path(data_dir)
-
-    if not data_path.exists():
-        raise FileNotFoundError(
-            f"Data directory '{data_dir}' not found.\n"
-            f"Create it and drop your PDF notes inside:\n"
-            f"  mkdir {data_dir}"
-        )
-
-    pdf_files = list(data_path.glob("*.pdf"))
-    if not pdf_files:
-        raise ValueError(
-            f"No PDF files found in '{data_dir}'.\n"
-            f"Add your lecture notes / textbook PDFs there and re-run."
-        )
-
-    print(f"\n📂  Found {len(pdf_files)} PDF(s) in '{data_dir}':")
-    for f in pdf_files:
-        print(f"     • {f.name}")
-
-    loader = PyPDFDirectoryLoader(data_dir)
-    documents = loader.load()
-
-    print(f"\n✅  Loaded {len(documents)} pages total")
-    return documents
+def get_embedding_model() -> HuggingFaceEmbeddings:
+    print("🤖  Loading embedding model...")
+    model = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+    print("✅  Embedding model ready")
+    return model
 
 
 def split_documents(documents: list) -> list:
-    """
-    Split pages into overlapping chunks.
-
-    Why RecursiveCharacterTextSplitter?
-      It tries to split on paragraph breaks first (\n\n),
-      then line breaks (\n), then sentences (.), then words.
-      This keeps semantically related text together.
-    """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", ".", "!", "?", " ", ""],
-        length_function=len,
     )
-
     chunks = splitter.split_documents(documents)
-
-    # Log chunk stats so you can tune CHUNK_SIZE if needed
-    sizes = [len(c.page_content) for c in chunks]
-    avg   = sum(sizes) / len(sizes) if sizes else 0
-    print(f"\n✂️   Split into {len(chunks)} chunks")
-    print(f"     Avg chunk size : {avg:.0f} chars")
-    print(f"     Min / Max      : {min(sizes)} / {max(sizes)} chars")
-
+    print(f"✂️   Split into {len(chunks)} chunks")
     return chunks
 
 
-def create_embeddings() -> HuggingFaceEmbeddings:
+# ─────────────────────────────────────────────
+# Pinecone vectorstore
+# ─────────────────────────────────────────────
+def get_pinecone_vectorstore(embedding_model, create_index=False):
     """
-    Load the HuggingFace embedding model (downloads on first run, ~80 MB).
-
-    all-MiniLM-L6-v2 facts:
-      • 384-dimensional vectors
-      • Extremely fast (CPU-friendly)
-      • Excellent semantic similarity for English text
-      • 100% free — no API key needed
+    Connects to Pinecone and returns a LangChain vectorstore.
+    Creates the index automatically if it doesn't exist.
     """
-    print(f"\n🤖  Loading embedding model: {EMBEDDING_MODEL}")
-    print("     (First run downloads ~80 MB — subsequent runs use cache)")
+    from pinecone import Pinecone, ServerlessSpec
+    from langchain_pinecone import PineconeVectorStore
 
-    embedding_model = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},   # change to "cuda" if you have a GPU
-        encode_kwargs={"normalize_embeddings": True},  # cosine similarity friendly
+    api_key = os.getenv("PINECONE_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "PINECONE_API_KEY not found in .env\n"
+            "Get a free key at: app.pinecone.io\n"
+            "Or remove it to use ChromaDB instead."
+        )
+
+    pc = Pinecone(api_key=api_key)
+
+    # Create index if it doesn't exist
+    existing = [i.name for i in pc.list_indexes()]
+    if PINECONE_INDEX not in existing:
+        print(f"📦  Creating Pinecone index '{PINECONE_INDEX}'...")
+        pc.create_index(
+            name=PINECONE_INDEX,
+            dimension=384,           # matches all-MiniLM-L6-v2 output
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        )
+        # Wait for index to be ready
+        while not pc.describe_index(PINECONE_INDEX).status["ready"]:
+            time.sleep(1)
+        print("✅  Pinecone index created")
+    else:
+        print(f"✅  Pinecone index '{PINECONE_INDEX}' found")
+
+    vectorstore = PineconeVectorStore(
+        index_name=PINECONE_INDEX,
+        embedding=embedding_model,
+        pinecone_api_key=api_key,
     )
-
-    print("✅  Embedding model ready")
-    return embedding_model
+    return vectorstore
 
 
-def store_in_chromadb(chunks: list, embedding_model, persist_dir: str) -> Chroma:
-    """
-    Embed all chunks and store them in ChromaDB.
+def clear_pinecone_index():
+    """Wipe all vectors from the Pinecone index (for re-ingestion)."""
+    from pinecone import Pinecone
 
-    ChromaDB persists to disk at persist_dir so you don't re-ingest on every run.
-    The collection is named 'study_notes' — you can change this.
-    """
-    persist_path = Path(persist_dir)
-    persist_path.mkdir(parents=True, exist_ok=True)
+    api_key = os.getenv("PINECONE_API_KEY")
+    if not api_key:
+        return
 
-    print(f"\n📦  Embedding {len(chunks)} chunks and storing in ChromaDB...")
-    print(f"     This may take 1–3 minutes for large document sets.\n")
+    pc = Pinecone(api_key=api_key)
+    existing = [i.name for i in pc.list_indexes()]
+    if PINECONE_INDEX in existing:
+        index = pc.Index(PINECONE_INDEX)
+        index.delete(delete_all=True)
+        print(f"🗑️   Cleared all vectors from '{PINECONE_INDEX}'")
 
-    start = time.time()
 
+# ─────────────────────────────────────────────
+# ChromaDB fallback
+# ─────────────────────────────────────────────
+def get_chroma_vectorstore(chunks, embedding_model, persist_dir="./vectorstore"):
+    """Falls back to ChromaDB if no Pinecone key is set."""
+    from langchain_community.vectorstores import Chroma
+
+    Path(persist_dir).mkdir(parents=True, exist_ok=True)
     vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embedding_model,
         persist_directory=persist_dir,
         collection_name="study_notes",
-        collection_metadata={"hnsw:space": "cosine"},  # cosine distance for retrieval
+        collection_metadata={"hnsw:space": "cosine"},
     )
-
-    elapsed = time.time() - start
-    print(f"\n✅  Stored {len(chunks)} chunks in ChromaDB")
-    print(f"     Time taken     : {elapsed:.1f}s")
-    print(f"     Persisted at   : {persist_dir}/")
-    print(f"     Collection     : study_notes")
-
+    print(f"✅  Stored in ChromaDB at {persist_dir}/")
     return vectorstore
 
 
-def verify_vectorstore(vectorstore: Chroma) -> None:
+# ─────────────────────────────────────────────
+# Main ingest functions
+# ─────────────────────────────────────────────
+def ingest_files(uploaded_files: list, clear_first: bool = False) -> dict:
     """
-    Quick sanity check — run a test similarity search to confirm everything works.
+    Ingest a list of uploaded file objects (from Streamlit file_uploader).
+    Each file object must have .name and .read() method.
+
+    Returns: {"status": "success", "chunks": N, "files": [...names]}
     """
-    print("\n🔍  Running verification search...")
+    print("\n" + "="*50)
+    print("  NoteNest — Ingesting uploaded files")
+    print("="*50)
 
-    test_query = "What is the main topic of these notes?"
-    results = vectorstore.similarity_search(test_query, k=2)
+    if not uploaded_files:
+        return {"status": "error", "message": "No files provided"}
 
-    if results:
-        print(f"✅  Retrieval working! Sample chunk from your notes:\n")
-        sample = results[0].page_content[:200].replace("\n", " ")
-        source = results[0].metadata.get("source", "unknown")
-        page   = results[0].metadata.get("page", "?")
-        print(f'     "{sample}..."')
-        print(f"     Source: {Path(source).name}, page {page}")
-    else:
-        print("⚠️  No results returned — check your PDFs contain readable text")
+    # Save uploaded files to temp directory and load them
+    documents = []
+    file_names = []
 
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for uploaded_file in uploaded_files:
+            # Write to temp file
+            tmp_path = Path(tmp_dir) / uploaded_file.name
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded_file.read())
 
-def ingest(data_dir: str = "./data", persist_dir: str = "./vectorstore") -> None:
-    """
-    Full ingestion pipeline:
-      1. Load PDFs  →  2. Split  →  3. Embed  →  4. Store  →  5. Verify
-    """
-    print("=" * 55)
-    print("  RAG Study Chatbot — Ingestion Pipeline")
-    print("=" * 55)
+            # Load PDF
+            loader = PyPDFLoader(str(tmp_path))
+            docs = loader.load()
 
-    # Step 1: Load
-    documents = load_pdfs(data_dir)
+            # Fix metadata source to show original filename
+            for doc in docs:
+                doc.metadata["source"] = uploaded_file.name
 
-    # Step 2: Split
+            documents.extend(docs)
+            file_names.append(uploaded_file.name)
+            print(f"  ✅  {uploaded_file.name} — {len(docs)} pages")
+
+    print(f"\n📄  Total pages loaded: {len(documents)}")
+
+    # Split
     chunks = split_documents(documents)
 
-    # Step 3: Embed
-    embedding_model = create_embeddings()
+    # Embed
+    embedding_model = get_embedding_model()
 
-    # Step 4: Store
-    vectorstore = store_in_chromadb(chunks, embedding_model, persist_dir)
+    # Store — Pinecone if key exists, else ChromaDB
+    use_pinecone = bool(os.getenv("PINECONE_API_KEY"))
 
-    # Step 5: Verify
-    verify_vectorstore(vectorstore)
+    if use_pinecone:
+        if clear_first:
+            clear_pinecone_index()
+        vectorstore = get_pinecone_vectorstore(embedding_model)
+        vectorstore.add_documents(chunks)
+        print(f"✅  Uploaded {len(chunks)} chunks to Pinecone")
+    else:
+        if clear_first:
+            import shutil
+            if Path("./vectorstore").exists():
+                shutil.rmtree("./vectorstore")
+                print("🗑️   Cleared ChromaDB vectorstore")
+        vectorstore = get_chroma_vectorstore(chunks, embedding_model)
 
-    print("\n" + "=" * 55)
-    print("  ✅  Ingestion complete! Next step:")
-    print("  Run:  streamlit run app.py")
-    print("=" * 55 + "\n")
+    return {
+        "status": "success",
+        "chunks": len(chunks),
+        "files": file_names,
+        "backend": "Pinecone" if use_pinecone else "ChromaDB",
+    }
+
+
+def ingest_from_folder(data_dir: str = "./data", clear_first: bool = False):
+    """Ingest all PDFs from a local folder (original Day 1 behaviour)."""
+    print("\n" + "="*50)
+    print("  NoteNest — Ingesting from folder")
+    print("="*50)
+
+    data_path = Path(data_dir)
+    if not data_path.exists() or not list(data_path.glob("*.pdf")):
+        raise FileNotFoundError(
+            f"No PDFs found in '{data_dir}'.\n"
+            "Add PDF files and retry."
+        )
+
+    loader = PyPDFDirectoryLoader(data_dir)
+    documents = loader.load()
+    print(f"📂  Loaded {len(documents)} pages from {data_dir}")
+
+    chunks = split_documents(documents)
+    embedding_model = get_embedding_model()
+
+    use_pinecone = bool(os.getenv("PINECONE_API_KEY"))
+
+    if use_pinecone:
+        if clear_first:
+            clear_pinecone_index()
+        vectorstore = get_pinecone_vectorstore(embedding_model)
+        vectorstore.add_documents(chunks)
+        print(f"✅  Uploaded {len(chunks)} chunks to Pinecone")
+    else:
+        if clear_first:
+            import shutil
+            if Path("./vectorstore").exists():
+                shutil.rmtree("./vectorstore")
+        vectorstore = get_chroma_vectorstore(chunks, embedding_model)
+
+    print("\n✅  Ingestion complete!")
+    print("   Run: streamlit run app.py")
+    print("="*50 + "\n")
 
 
 # ─────────────────────────────────────────────
 # CLI entry point
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Ingest PDFs into ChromaDB for the RAG Study Chatbot"
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="./data",
-        help="Folder containing your PDF notes (default: ./data)"
-    )
-    parser.add_argument(
-        "--persist_dir",
-        type=str,
-        default="./vectorstore",
-        help="Where to save the ChromaDB vector store (default: ./vectorstore)"
-    )
+    parser = argparse.ArgumentParser(description="NoteNest ingestion pipeline")
+    parser.add_argument("--data_dir", default="./data")
+    parser.add_argument("--clear", action="store_true",
+                        help="Clear existing index before ingesting")
     args = parser.parse_args()
-
-    ingest(data_dir=args.data_dir, persist_dir=args.persist_dir)
+    ingest_from_folder(data_dir=args.data_dir, clear_first=args.clear)

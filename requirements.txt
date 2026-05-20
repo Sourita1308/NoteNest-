@@ -1,28 +1,35 @@
-# RAG Study Chatbot – Python Dependencies
+# NoteNest — Requirements (Day 3 updated)
 # Install with: pip install -r requirements.txt
 
-# — Core LangChain —
-langchain
-langchain-community
-langchain-openai
+# ── Core LangChain ──────────────────────────────
+langchain==0.2.16
+langchain-community==0.2.16
+langchain-openai==0.1.23
 
-# — Vector store —
+# ── Gemini (FREE tier) ───────────────────────────
+langchain-google-genai==1.0.8
+google-generativeai==0.7.2
+
+# ── Pinecone (cloud vector DB — Day 3) ──────────
+pinecone
+langchain-pinecone
+
+# ── ChromaDB (local fallback) ────────────────────
 chromadb
 
-# — Embeddings (free, local, no API key) —
-sentence-transformers
-huggingface-hub
+# ── Embeddings ───────────────────────────────────
+sentence-transformers==3.0.1
+huggingface-hub==0.24.5
 
-# — PDF loading —
-pypdf
+# ── PDF loading ──────────────────────────────────
+pypdf==4.3.1
 
-# — LLM APIs (choose one or both) —
-openai
-google-generativeai
+# ── OpenAI (paid, optional) ──────────────────────
+openai==1.40.0
 
-# — UI —
-streamlit
+# ── UI ───────────────────────────────────────────
+streamlit==1.37.1
 
-# — Utilities —
-python-dotenv
-tiktoken
+# ── Utilities ────────────────────────────────────
+python-dotenv==1.0.1
+tiktoken==0.7.0
