@@ -1,4 +1,4 @@
-# NoteNest — Requirements (Day 4 updated)
+# NoteNest — Requirements (Day 5 updated)
 # Install with: pip install -r requirements.txt
 
 # ── Core LangChain ──────────────────────────────
@@ -24,17 +24,21 @@ huggingface-hub==0.24.5
 # ── PDF loading ──────────────────────────────────
 pypdf==4.3.1
 
-# ── OpenAI (Whisper API + GPT) ───────────────────
+# ── OpenAI (Whisper API + GPT optional) ──────────
 openai==1.40.0
 
 # ── Voice Input (Day 4) ──────────────────────────
-openai-whisper     # local Whisper transcription (free)
-sounddevice==0.4.7            # microphone recording
-scipy==1.13.1                 # audio processing
-numpy==1.26.4                 # array handling
+openai-whisper
+sounddevice==0.4.7
+scipy==1.13.1
+numpy==1.26.4
+
+# ── Voice Output (Day 5) ─────────────────────────
+gTTS==2.5.1                   # free Google TTS
+elevenlabs==1.3.0             # premium ultra-realistic TTS (optional)
 
 # ── UI ───────────────────────────────────────────
-streamlit==1.37.1
+streamlit
 
 # ── Utilities ────────────────────────────────────
 python-dotenv==1.0.1

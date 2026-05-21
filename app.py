@@ -1,26 +1,30 @@
 """
-NoteNest — Day 4
-app.py — Full UI with Voice Input
+NoteNest — Day 5
+app.py — Full Voice Conversation Loop
 
-New in Day 4:
-  - 🎙 Mic button next to chat input
-  - Record audio → Whisper transcribes → auto-fills question
-  - Works with local Whisper (free) or Whisper API (paid)
-  - Live recording timer
-  - Graceful fallback if mic packages not installed
-  - All Day 3 features retained
+New in Day 5:
+  - NoteNest speaks answers back using gTTS or ElevenLabs
+  - Voice toggle in sidebar (enable/disable voice responses)
+  - Language selector for TTS output
+  - ElevenLabs voice picker when API key is set
+  - Auto-play audio after each answer
+  - Full voice loop: speak question → get answer → hear answer
+  - All Day 4 features retained
 
 Run with:
     streamlit run app.py
 """
 
 import os
-import time
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import base64
 import streamlit as st
 from pathlib import Path
 from rag_chain import build_chain
 from ingest import ingest_files
 from voice_input import check_dependencies, transcribe_audio_file
+from voice_output import speak, get_tts_status, GTTS_LANG_MAP, ELEVENLABS_VOICES
 
 
 # ─────────────────────────────────────────────
@@ -66,6 +70,7 @@ st.markdown("""
     .pill-red    { background:#fee2e2; color:#991b1b; }
     .pill-orange { background:#ffedd5; color:#9a3412; }
     .pill-purple { background:#ede9fe; color:#5b21b6; }
+    .pill-pink   { background:#fce7f3; color:#9d174d; }
 
     .upload-hint {
         font-size: 12px;
@@ -74,29 +79,39 @@ st.markdown("""
         margin-bottom: 8px;
     }
 
-    .voice-hint {
-        font-size: 12px;
-        color: #6b7280;
-        padding: 6px 10px;
-        background: #f9fafb;
-        border-radius: 6px;
-        border: 1px dashed #d1d5db;
-        margin-top: 6px;
+    .voice-card {
+        background: #f5f3ff;
+        border: 1px solid #ddd6fe;
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin: 8px 0;
+        font-size: 13px;
     }
 
-    .recording-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        background: #fee2e2;
-        color: #991b1b;
-        font-size: 13px;
+    .audio-label {
+        font-size: 12px;
+        color: #6b7280;
+        margin-bottom: 4px;
         font-weight: 500;
-        padding: 4px 12px;
-        border-radius: 20px;
     }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+# Cached resources
+# ─────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_chain():
+    return build_chain()
+
+@st.cache_resource(show_spinner=False)
+def get_voice_deps():
+    return check_dependencies()
+
+@st.cache_resource(show_spinner=False)
+def get_tts():
+    return get_tts_status()
 
 
 # ─────────────────────────────────────────────
@@ -108,30 +123,31 @@ defaults = {
     "ingested_files": [],
     "kb_ready": Path("./vectorstore").exists(),
     "voice_transcript": "",
-    "is_recording": False,
-    "recorder": None,
-    "record_start_time": None,
+    "last_audio_b64": None,
 }
-for key, val in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = val
-
-
-# ─────────────────────────────────────────────
-# Check voice dependencies once
-# ─────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def get_voice_deps():
-    return check_dependencies()
-
-@st.cache_resource(show_spinner=False)
-def get_chain():
-    return build_chain()
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 voice_deps = get_voice_deps()
-voice_available = voice_deps["sounddevice"] and (
+tts_status = get_tts()
+voice_input_ok  = voice_deps["sounddevice"] and (
     voice_deps["whisper_local"] or voice_deps["whisper_api"]
 )
+voice_output_ok = tts_status["gtts"] or tts_status["elevenlabs"]
+
+
+# ─────────────────────────────────────────────
+# Helper — auto-play audio in browser
+# ─────────────────────────────────────────────
+def autoplay_audio(b64_audio: str):
+    """Inject an auto-playing hidden audio element into the page."""
+    audio_html = f"""
+    <audio autoplay style="display:none;">
+        <source src="data:audio/mp3;base64,{b64_audio}" type="audio/mp3">
+    </audio>
+    """
+    st.markdown(audio_html, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
@@ -142,7 +158,7 @@ with st.sidebar:
     st.markdown("*Your AI study assistant*")
     st.divider()
 
-    # ── Knowledge base status ──
+    # ── Knowledge base ──
     st.markdown("**Knowledge Base**")
     using_pinecone = bool(os.getenv("PINECONE_API_KEY"))
     backend_label = "Pinecone ☁️" if using_pinecone else "ChromaDB 💾"
@@ -157,7 +173,6 @@ with st.sidebar:
         st.markdown('<span class="status-pill pill-green">✅ Knowledge base ready</span>',
                     unsafe_allow_html=True)
         if st.session_state.ingested_files:
-            st.markdown(f"**{len(st.session_state.ingested_files)} file(s) loaded:**")
             for f in st.session_state.ingested_files:
                 st.markdown(f"• {f}")
     else:
@@ -166,14 +181,13 @@ with st.sidebar:
 
     st.divider()
 
-    # ── PDF Upload ──
+    # ── Upload ──
     st.markdown("**Upload Your Notes**")
     st.markdown('<div class="upload-hint">Drop lecture PDFs here</div>',
                 unsafe_allow_html=True)
 
     uploaded_files = st.file_uploader(
-        "Upload PDFs",
-        type=["pdf"],
+        "Upload PDFs", type=["pdf"],
         accept_multiple_files=True,
         label_visibility="collapsed",
     )
@@ -187,19 +201,19 @@ with st.sidebar:
 
     if ingest_btn and uploaded_files:
         with st.spinner(f"Processing {len(uploaded_files)} PDF(s)..."):
-            progress = st.progress(0, text="Starting...")
+            prog = st.progress(0, "Starting...")
             try:
-                progress.progress(20, text="Loading PDFs...")
+                prog.progress(20, "Loading PDFs...")
                 result = ingest_files(uploaded_files, clear_first=False)
-                progress.progress(100, text="Done!")
+                prog.progress(100, "Done!")
                 if result["status"] == "success":
                     st.session_state.ingested_files.extend(result["files"])
                     st.session_state.kb_ready = True
                     st.cache_resource.clear()
-                    st.success(f"✅ {result['chunks']} chunks ingested into {result['backend']}")
+                    st.success(f"✅ {result['chunks']} chunks → {result['backend']}")
                     st.rerun()
             except Exception as e:
-                st.error(f"Error: {str(e)}")
+                st.error(f"Error: {e}")
 
     if clear_btn:
         try:
@@ -210,72 +224,105 @@ with st.sidebar:
                 import shutil
                 if Path("./vectorstore").exists():
                     shutil.rmtree("./vectorstore")
-            st.session_state.ingested_files = []
-            st.session_state.kb_ready = False
-            st.session_state.messages = []
-            st.session_state.chat_history = []
+            for k in ["ingested_files","kb_ready","messages","chat_history"]:
+                st.session_state[k] = [] if isinstance(
+                    st.session_state[k], list) else False
             st.cache_resource.clear()
             st.success("🗑️ Cleared")
             st.rerun()
         except Exception as e:
-            st.error(f"Error: {str(e)}")
+            st.error(f"Error: {e}")
 
     st.divider()
 
-    # ── Voice settings ──
+    # ── Voice Input settings ──
     st.markdown("**Voice Input 🎙️**")
-
-    if voice_available:
-        st.markdown('<span class="status-pill pill-purple">✅ Voice ready</span>',
+    if voice_input_ok:
+        st.markdown('<span class="status-pill pill-purple">✅ Whisper ready</span>',
                     unsafe_allow_html=True)
-
-        use_api_whisper = st.toggle(
-            "Use Whisper API (faster)",
-            value=False,
-            help="ON = Whisper API (needs OPENAI_API_KEY, costs $0.006/min)\nOFF = Local Whisper (free, offline)"
-        )
-
-        whisper_model = st.selectbox(
-            "Local Whisper model",
-            ["tiny", "base", "small"],
-            index=1,
-            help="base = best balance of speed and accuracy",
-            disabled=use_api_whisper,
-        )
-        st.markdown(
-            '<div class="upload-hint">Click 🎙 in the chat area to record</div>',
-            unsafe_allow_html=True
-        )
+        use_api_whisper = st.toggle("Use Whisper API", value=False,
+            help="ON = paid API | OFF = free local")
+        whisper_model = st.selectbox("Whisper model",
+            ["tiny","base","small"], index=1,
+            disabled=use_api_whisper)
     else:
         st.markdown('<span class="status-pill pill-orange">⚠️ Not installed</span>',
                     unsafe_allow_html=True)
-        st.markdown(
-            '<div class="voice-hint">Run in terminal:<br>'
-            '<code>pip install sounddevice openai-whisper</code><br>'
-            'Then restart the app.</div>',
-            unsafe_allow_html=True
-        )
+        st.code("pip install sounddevice openai-whisper", language="bash")
         use_api_whisper = False
         whisper_model = "base"
+
+    st.divider()
+
+    # ── Voice Output settings ──
+    st.markdown("**Voice Output 🔊**")
+
+    if voice_output_ok:
+        engine = tts_status["active_engine"]
+        engine_class = "pill-pink" if engine == "ElevenLabs" else "pill-green"
+        st.markdown(
+            f'<span class="status-pill {engine_class}">✅ {engine}</span>',
+            unsafe_allow_html=True
+        )
+
+        voice_responses = st.toggle(
+            "Speak answers aloud",
+            value=True,
+            help="NoteNest reads answers back to you"
+        )
+
+        # Language selector (gTTS)
+        if engine != "ElevenLabs":
+            tts_lang_name = st.selectbox(
+                "Response language",
+                list(GTTS_LANG_MAP.keys()),
+                index=0,
+                help="Language for spoken responses"
+            )
+            tts_lang_code = GTTS_LANG_MAP[tts_lang_name]
+            selected_voice = None
+        else:
+            # ElevenLabs voice picker
+            selected_voice = st.selectbox(
+                "Voice",
+                list(ELEVENLABS_VOICES.keys()),
+                index=0,
+            )
+            tts_lang_code = "en"
+
+        # Volume / speed note
+        st.markdown(
+            '<div class="upload-hint">Answers auto-play after generation</div>',
+            unsafe_allow_html=True
+        )
+
+    else:
+        st.markdown('<span class="status-pill pill-orange">⚠️ Not installed</span>',
+                    unsafe_allow_html=True)
+        st.code("pip install gTTS", language="bash")
+        voice_responses = False
+        tts_lang_code = "en"
+        selected_voice = None
 
     st.divider()
 
     # ── Chat settings ──
     st.markdown("**Chat Settings**")
     show_sources = st.toggle("Show citations", value=True)
-    num_sources = st.slider("Sources per answer", 1, 4, 2)
+    num_sources  = st.slider("Sources per answer", 1, 4, 2)
 
     if st.button("💬 Clear chat", use_container_width=True):
         st.session_state.messages = []
         st.session_state.chat_history = []
         st.session_state.voice_transcript = ""
+        st.session_state.last_audio_b64 = None
         st.rerun()
 
     st.divider()
     st.markdown(
-        f"<div style='font-size:11px;color:#9ca3af;'>NoteNest Day 4<br>"
+        f"<div style='font-size:11px;color:#9ca3af;'>NoteNest Day 5<br>"
         f"Backend: {backend_label}<br>"
-        f"Voice: {'Whisper API' if use_api_whisper else f'Local ({whisper_model})'}</div>",
+        f"TTS: {tts_status['active_engine']}</div>",
         unsafe_allow_html=True
     )
 
@@ -284,32 +331,43 @@ with st.sidebar:
 # MAIN AREA
 # ─────────────────────────────────────────────
 st.markdown("## 📚 NoteNest")
-st.markdown("*Ask anything from your lecture notes — by typing or speaking*")
+st.markdown("*Ask by typing or speaking — NoteNest answers and reads back to you*")
 
 # ── Welcome ──
 if not st.session_state.messages:
     with st.chat_message("assistant"):
         if st.session_state.kb_ready:
-            voice_tip = " or click **🎙 Record** below to ask by voice" if voice_available else ""
             st.markdown(
-                f"👋 Hi! I'm **NoteNest**.\n\n"
-                f"Your notes are loaded. Type a question{voice_tip}.\n\n"
-                f"**Try asking:**\n"
-                f"- *Explain CPU scheduling algorithms*\n"
-                f"- *What is a deadlock?*\n"
-                f"- *Summarise key points from my notes*"
+                "👋 Hi! I'm **NoteNest**.\n\n"
+                "Your notes are loaded. I can now **speak answers back to you**. "
+                "Type or use 🎙 below to ask a question — "
+                "I'll answer from your PDFs and read it aloud.\n\n"
+                "**Try asking:**\n"
+                "- *Explain Newton's interpolation formula*\n"
+                "- *What is CPU scheduling?*\n"
+                "- *Summarise chapter 1*"
             )
         else:
             st.markdown(
                 "👋 Hi! I'm **NoteNest**.\n\n"
-                "📂 Upload your lecture PDFs in the sidebar → click **Ingest**.\n\n"
-                "Then ask me anything!"
+                "📂 Upload your lecture PDFs in the sidebar → click **Ingest**."
             )
 
 # ── Chat history ──
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+
+        # Re-render audio player for past assistant messages
+        if (message["role"] == "assistant"
+                and "audio_b64" in message
+                and message["audio_b64"]):
+            st.markdown('<div class="audio-label">🔊 Replay answer</div>',
+                        unsafe_allow_html=True)
+            audio_bytes = base64.b64decode(message["audio_b64"])
+            st.audio(audio_bytes, format="audio/mp3")
+
+        # Sources
         if (message["role"] == "assistant" and show_sources
                 and "sources" in message and message["sources"]):
             with st.expander(f"📄 {min(len(message['sources']), num_sources)} source(s)"):
@@ -326,64 +384,56 @@ for message in st.session_state.messages:
 
 
 # ─────────────────────────────────────────────
-# VOICE INPUT SECTION
+# VOICE INPUT
 # ─────────────────────────────────────────────
-if voice_available and st.session_state.kb_ready:
+if voice_input_ok and st.session_state.kb_ready:
     st.markdown("---")
-
-    # ── Streamlit native audio recorder (simplest approach) ──
-    st.markdown("**🎙️ Voice Input** — Record your question")
+    st.markdown("**🎙️ Voice Input**")
 
     col_rec, col_status = st.columns([1, 3])
-
     with col_rec:
         audio_data = st.audio_input(
             "Click to record",
             label_visibility="collapsed",
             key="audio_recorder"
         )
-
     with col_status:
-        if audio_data is not None:
+        if audio_data:
             st.markdown(
-                '<div class="recording-badge">🎧 Processing voice...</div>',
+                '<div class="voice-card">🎧 Transcribing...</div>',
                 unsafe_allow_html=True
             )
 
-    # Process recorded audio
-    if audio_data is not None:
+    if audio_data:
         with st.spinner("Transcribing with Whisper..."):
             try:
-                audio_bytes = audio_data.read()
                 transcript = transcribe_audio_file(
-                    audio_bytes,
+                    audio_data.read(),
                     use_api=use_api_whisper
                 )
                 if transcript:
                     st.session_state.voice_transcript = transcript
                     st.success(f"🎤 Heard: *\"{transcript}\"*")
                 else:
-                    st.warning("Couldn't hear anything clearly. Try again.")
+                    st.warning("Couldn't hear clearly. Try again.")
             except Exception as e:
-                st.error(f"Transcription error: {str(e)}")
+                st.error(f"Transcription error: {e}")
 
 
 # ─────────────────────────────────────────────
 # CHAT INPUT
 # ─────────────────────────────────────────────
-
-# Pre-fill with voice transcript if available
-prefill_value = st.session_state.get("voice_transcript", "")
+prefill = st.session_state.get("voice_transcript", "")
 
 question = st.chat_input(
     "Ask a question... (or use 🎙 above to speak)",
     disabled=not st.session_state.kb_ready,
 )
 
-# If no typed question but we have a voice transcript, use that
-if not question and prefill_value:
-    question = prefill_value
-    st.session_state.voice_transcript = ""   # clear after use
+# Use voice transcript if no typed question
+if not question and prefill:
+    question = prefill
+    st.session_state.voice_transcript = ""
 
 # ── Process question ──
 if question:
@@ -391,6 +441,7 @@ if question:
     with st.chat_message("user"):
         st.markdown(question)
 
+    # ── Generate answer ──
     with st.chat_message("assistant"):
         with st.spinner("Searching your notes..."):
             try:
@@ -399,14 +450,39 @@ if question:
                     "question": question,
                     "chat_history": st.session_state.chat_history,
                 })
-                answer = result["answer"]
+                answer      = result["answer"]
                 source_docs = result.get("source_documents", [])
             except Exception as e:
-                answer = f"Something went wrong: {str(e)}"
+                answer      = f"Something went wrong: {e}"
                 source_docs = []
 
         st.markdown(answer)
 
+        # ── Voice output ──
+        audio_b64 = None
+        if voice_responses and voice_output_ok:
+            with st.spinner("🔊 Generating audio..."):
+                try:
+                    audio_b64 = speak(
+                        answer,
+                        lang=tts_lang_code,
+                        force_gtts=(tts_status["active_engine"] != "ElevenLabs"),
+                        elevenlabs_voice=selected_voice or "Rachel (calm)",
+                    )
+                except Exception as e:
+                    st.warning(f"TTS error: {e}")
+
+            if audio_b64:
+                # Auto-play
+                autoplay_audio(audio_b64)
+
+                # Also show manual replay player
+                st.markdown('<div class="audio-label">🔊 Answer audio</div>',
+                            unsafe_allow_html=True)
+                audio_bytes = base64.b64decode(audio_b64)
+                st.audio(audio_bytes, format="audio/mp3")
+
+        # ── Sources ──
         sources = [
             {
                 "source":  doc.metadata.get("source", "Unknown"),
@@ -429,14 +505,16 @@ if question:
                         unsafe_allow_html=True
                     )
 
+    # Save message with audio
     st.session_state.messages.append({
-        "role": "assistant",
-        "content": answer,
-        "sources": sources,
+        "role":      "assistant",
+        "content":   answer,
+        "sources":   sources,
+        "audio_b64": audio_b64,
     })
+
     st.session_state.chat_history.append((question, answer))
     if len(st.session_state.chat_history) > 5:
         st.session_state.chat_history = st.session_state.chat_history[-5:]
 
-    # Clear voice transcript
     st.session_state.voice_transcript = ""
