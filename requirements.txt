@@ -1,4 +1,4 @@
-# NoteNest — Requirements (Day 3 updated)
+# NoteNest — Requirements (Day 4 updated)
 # Install with: pip install -r requirements.txt
 
 # ── Core LangChain ──────────────────────────────
@@ -10,7 +10,7 @@ langchain-openai==0.1.23
 langchain-google-genai==1.0.8
 google-generativeai==0.7.2
 
-# ── Pinecone (cloud vector DB — Day 3) ──────────
+# ── Pinecone (cloud vector DB) ───────────────────
 pinecone
 langchain-pinecone
 
@@ -24,8 +24,14 @@ huggingface-hub==0.24.5
 # ── PDF loading ──────────────────────────────────
 pypdf==4.3.1
 
-# ── OpenAI (paid, optional) ──────────────────────
+# ── OpenAI (Whisper API + GPT) ───────────────────
 openai==1.40.0
+
+# ── Voice Input (Day 4) ──────────────────────────
+openai-whisper     # local Whisper transcription (free)
+sounddevice==0.4.7            # microphone recording
+scipy==1.13.1                 # audio processing
+numpy==1.26.4                 # array handling
 
 # ── UI ───────────────────────────────────────────
 streamlit==1.37.1
